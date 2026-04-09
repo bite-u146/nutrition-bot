@@ -1,10 +1,11 @@
 import os
-import json
 import logging
 import re
 import anthropic
-from datetime import datetime, time, timezone, timedelta
-from pathlib import Path
+import psycopg2
+import psycopg2.pool
+from contextlib import contextmanager
+from datetime import datetime, date, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -21,21 +22,229 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DIARY_FILE = Path("diary.json")
+# ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
-# Структура diary.json:
-# {
-#   "<user_id>": {
-#     "timezone_offset": 4,          # смещение UTC в часах
-#     "last_summary_sent": "2026-04-09",
-#     "2026-04-09": {
-#       "entries": [{"time": "12:30", "dish": "...", "calories": 0, ...}],
-#       "total":   {"calories": 0, "proteins": 0, "fats": 0, "carbs": 0, "fiber": 0}
-#     }
-#   }
-# }
+db_pool: psycopg2.pool.SimpleConnectionPool | None = None
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CREATE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id          BIGINT PRIMARY KEY,
+    timezone_offset  INTEGER NOT NULL DEFAULT 0,
+    last_summary_sent DATE
+);
+
+CREATE TABLE IF NOT EXISTS diary_entries (
+    id          SERIAL PRIMARY KEY,
+    user_id     BIGINT  NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    entry_date  DATE    NOT NULL,
+    entry_time  TIME    NOT NULL,
+    dish        TEXT    NOT NULL,
+    calories    REAL    NOT NULL DEFAULT 0,
+    proteins    REAL    NOT NULL DEFAULT 0,
+    fats        REAL    NOT NULL DEFAULT 0,
+    carbs       REAL    NOT NULL DEFAULT 0,
+    fiber       REAL    NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_diary_user_date ON diary_entries(user_id, entry_date);
+"""
+
+
+def init_db() -> None:
+    global db_pool
+    db_url = os.environ["DATABASE_URL"]
+    # Railway иногда отдаёт postgres://, psycopg2 требует postgresql://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, db_url)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(CREATE_TABLES_SQL)
+        conn.commit()
+    logger.info("База данных инициализирована.")
+
+
+@contextmanager
+def get_conn():
+    conn = db_pool.getconn()
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+
+# ─── DB-операции ─────────────────────────────────────────────────────────────
+
+def db_ensure_user(user_id: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (user_id,),
+            )
+        conn.commit()
+
+
+def db_get_user(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timezone_offset, last_summary_sent FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return {"timezone_offset": row[0], "last_summary_sent": row[1]}
+
+
+def db_set_timezone(user_id: int, offset: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET timezone_offset = %s WHERE user_id = %s",
+                (offset, user_id),
+            )
+        conn.commit()
+
+
+def db_add_entry(
+    user_id: int,
+    entry_date: date,
+    entry_time: str,
+    dish: str,
+    nutrition: dict,
+) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO diary_entries
+                    (user_id, entry_date, entry_time, dish,
+                     calories, proteins, fats, carbs, fiber)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id, entry_date, entry_time, dish,
+                    nutrition["calories"], nutrition["proteins"],
+                    nutrition["fats"],    nutrition["carbs"],
+                    nutrition["fiber"],
+                ),
+            )
+        conn.commit()
+
+
+def db_get_day_entries(user_id: int, entry_date: date) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entry_time, dish, calories, proteins, fats, carbs, fiber
+                FROM diary_entries
+                WHERE user_id = %s AND entry_date = %s
+                ORDER BY entry_time
+                """,
+                (user_id, entry_date),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "time": str(r[0])[:5],
+            "dish": r[1],
+            "calories": r[2], "proteins": r[3],
+            "fats": r[4], "carbs": r[5], "fiber": r[6],
+        }
+        for r in rows
+    ]
+
+
+def db_get_day_total(user_id: int, entry_date: date) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(calories),0), COALESCE(SUM(proteins),0),
+                    COALESCE(SUM(fats),0),     COALESCE(SUM(carbs),0),
+                    COALESCE(SUM(fiber),0)
+                FROM diary_entries
+                WHERE user_id = %s AND entry_date = %s
+                """,
+                (user_id, entry_date),
+            )
+            row = cur.fetchone()
+    if not row or row[0] == 0:
+        return None
+    return {
+        "count":    row[0],
+        "calories": round(row[1], 1),
+        "proteins": round(row[2], 1),
+        "fats":     round(row[3], 1),
+        "carbs":    round(row[4], 1),
+        "fiber":    round(row[5], 1),
+    }
+
+
+def db_get_history(user_id: int, start_date: date, end_date: date) -> list[dict]:
+    """Суммы по каждому дню в диапазоне [start_date, end_date]."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    entry_date,
+                    COUNT(*),
+                    COALESCE(SUM(calories),0), COALESCE(SUM(proteins),0),
+                    COALESCE(SUM(fats),0),     COALESCE(SUM(carbs),0),
+                    COALESCE(SUM(fiber),0)
+                FROM diary_entries
+                WHERE user_id = %s AND entry_date BETWEEN %s AND %s
+                GROUP BY entry_date
+                ORDER BY entry_date DESC
+                """,
+                (user_id, start_date, end_date),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "date":     r[0],
+            "count":    r[1],
+            "calories": round(r[2], 1),
+            "proteins": round(r[3], 1),
+            "fats":     round(r[4], 1),
+            "carbs":    round(r[5], 1),
+            "fiber":    round(r[6], 1),
+        }
+        for r in rows
+    ]
+
+
+def db_get_all_users() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, timezone_offset, last_summary_sent FROM users")
+            rows = cur.fetchall()
+    return [
+        {"user_id": r[0], "timezone_offset": r[1], "last_summary_sent": r[2]}
+        for r in rows
+    ]
+
+
+def db_mark_summary_sent(user_id: int, sent_date: date) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET last_summary_sent = %s WHERE user_id = %s",
+                (sent_date, user_id),
+            )
+        conn.commit()
+
+
+# ─── Bot logic ────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Ты — диетолог-эксперт и нутрициолог. Твоя задача — анализировать блюда и продукты питания, которые описывает пользователь, и рассчитывать их пищевую ценность.
 
@@ -62,124 +271,67 @@ SYSTEM_PROMPT = """Ты — диетолог-эксперт и нутрицио�
 
 Всегда отвечай на русском языке. Будь дружелюбным и полезным."""
 
-# История диалогов: {user_id: [{"role": ..., "content": ...}, ...]}
 user_histories: dict[int, list] = {}
-
-# Последние распарсенные данные о питании, ожидающие сохранения
 pending_nutrition: dict[int, dict] = {}
 
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
-# ─── Дневник (JSON) ──────────────────────────────────────────────────────────
-
-def load_diary() -> dict:
-    if DIARY_FILE.exists():
-        with open(DIARY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_diary_file(data: dict) -> None:
-    with open(DIARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_user_tz(user_data: dict) -> timezone:
-    offset = user_data.get("timezone_offset", 0)
-    return timezone(timedelta(hours=offset))
-
-
-def ensure_user(diary: dict, uid: str) -> None:
-    """Создаёт запись пользователя если её нет."""
-    if uid not in diary:
-        diary[uid] = {"timezone_offset": 0}
-
-
-def add_diary_entry(
-    user_id: int, date_str: str, time_str: str, dish: str, nutrition: dict
-) -> None:
-    diary = load_diary()
-    uid = str(user_id)
-    ensure_user(diary, uid)
-
-    if date_str not in diary[uid]:
-        diary[uid][date_str] = {
-            "entries": [],
-            "total": {"calories": 0, "proteins": 0, "fats": 0, "carbs": 0, "fiber": 0},
-        }
-
-    diary[uid][date_str]["entries"].append({"time": time_str, "dish": dish, **nutrition})
-
-    for key in ("calories", "proteins", "fats", "carbs", "fiber"):
-        diary[uid][date_str]["total"][key] = round(
-            diary[uid][date_str]["total"].get(key, 0) + nutrition.get(key, 0), 1
-        )
-
-    save_diary_file(diary)
-
-
 # ─── Парсинг ответа Клода ────────────────────────────────────────────────────
 
 def parse_nutrition_from_response(text: str) -> dict | None:
-    """
-    Извлекает КБЖУ из ответа Клода.
-    Если блюд несколько — берёт последний блок значений (итог).
-    """
-    dish_re = re.compile(r"🍽️\s*\*{0,2}([^\*\n]+?)\*{0,2}\s*\n")
-    cal_re = re.compile(r"Калории[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
-    prot_re = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г", re.IGNORECASE)
-    fat_re = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г", re.IGNORECASE)
-    carb_re = re.compile(r"Углеводы[:\s]+(\d+(?:[.,]\d+)?)\s*г", re.IGNORECASE)
-    fiber_re = re.compile(r"Клетчатка[:\s]+(\d+(?:[.,]\d+)?)\s*г", re.IGNORECASE)
+    dish_re  = re.compile(r"🍽️\s*\*{0,2}([^\*\n]+?)\*{0,2}\s*\n")
+    cal_re   = re.compile(r"Калории[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
+    prot_re  = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г",      re.IGNORECASE)
+    fat_re   = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г",       re.IGNORECASE)
+    carb_re  = re.compile(r"Углеводы[:\s]+(\d+(?:[.,]\d+)?)\s*г",   re.IGNORECASE)
+    fiber_re = re.compile(r"Клетчатка[:\s]+(\d+(?:[.,]\d+)?)\s*г",  re.IGNORECASE)
 
-    def floats(pattern):
-        return [float(v.replace(",", ".")) for v in pattern.findall(text)]
+    def floats(p):
+        return [float(v.replace(",", ".")) for v in p.findall(text)]
 
-    dishes = dish_re.findall(text)
+    dishes       = dish_re.findall(text)
     calories_all = floats(cal_re)
     proteins_all = floats(prot_re)
-    fats_all = floats(fat_re)
-    carbs_all = floats(carb_re)
-    fiber_all = floats(fiber_re)
+    fats_all     = floats(fat_re)
+    carbs_all    = floats(carb_re)
+    fiber_all    = floats(fiber_re)
 
     if not calories_all:
         return None
 
-    # Если наборов значений больше чем блюд — последний набор это итог
     if len(calories_all) > max(len(dishes), 1):
+        # Последний блок — итог нескольких блюд
         calories = calories_all[-1]
         proteins = proteins_all[-1] if proteins_all else 0
-        fats = fats_all[-1] if fats_all else 0
-        carbs = carbs_all[-1] if carbs_all else 0
-        fiber = fiber_all[-1] if fiber_all else 0
-        dish = "Несколько блюд: " + ", ".join(dishes) if dishes else "Несколько блюд"
+        fats     = fats_all[-1]     if fats_all     else 0
+        carbs    = carbs_all[-1]    if carbs_all     else 0
+        fiber    = fiber_all[-1]    if fiber_all     else 0
+        dish = ("Несколько блюд: " + ", ".join(dishes)) if dishes else "Несколько блюд"
     else:
         calories = sum(calories_all)
         proteins = sum(proteins_all) if proteins_all else 0
-        fats = sum(fats_all) if fats_all else 0
-        carbs = sum(carbs_all) if carbs_all else 0
-        fiber = sum(fiber_all) if fiber_all else 0
+        fats     = sum(fats_all)     if fats_all     else 0
+        carbs    = sum(carbs_all)    if carbs_all     else 0
+        fiber    = sum(fiber_all)    if fiber_all     else 0
         dish = ", ".join(dishes) if dishes else "Блюдо"
 
     return {
-        "dish": dish.strip(),
+        "dish":     dish.strip(),
         "calories": round(calories, 1),
         "proteins": round(proteins, 1),
-        "fats": round(fats, 1),
-        "carbs": round(carbs, 1),
-        "fiber": round(fiber, 1),
+        "fats":     round(fats, 1),
+        "carbs":    round(carbs, 1),
+        "fiber":    round(fiber, 1),
     }
 
 
 # ─── Форматирование ──────────────────────────────────────────────────────────
 
-def format_daily_summary(date_str: str, total: dict, n_entries: int = 0) -> str:
-    header = f"📊 *Итог за {date_str}*"
-    if n_entries:
-        header += f" _({n_entries} зап.)_"
+def fmt_total(total: dict, header: str = "") -> str:
     return (
-        f"{header}\n\n"
+        f"{header}\n\n" if header else ""
+    ) + (
         f"├─ Калории: {total['calories']} ккал\n"
         f"├─ Белки: {total['proteins']} г\n"
         f"├─ Жиры: {total['fats']} г\n"
@@ -193,14 +345,7 @@ def format_daily_summary(date_str: str, total: dict, n_entries: int = 0) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_histories[user_id] = []
-
-    # Регистрируем пользователя если новый
-    diary = load_diary()
-    uid = str(user_id)
-    if uid not in diary:
-        ensure_user(diary, uid)
-        save_diary_file(diary)
-
+    db_ensure_user(user_id)
     await update.message.reply_text(
         "🥗 *Бот для расчёта калорий и питательной ценности блюд*\n\n"
         "Опишите блюдо или продукт — я рассчитаю его пищевую ценность.\n\n"
@@ -215,31 +360,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user_histories[user_id] = []
+    user_histories[update.effective_user.id] = []
     await update.message.reply_text("История диалога очищена. Начинаем заново! 🔄")
 
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /timezone        — показать текущий часовой пояс
-    /timezone +4     — установить UTC+4
-    /timezone -5     — установить UTC-5
-    """
     user_id = update.effective_user.id
-    uid = str(user_id)
-    diary = load_diary()
-    ensure_user(diary, uid)
+    db_ensure_user(user_id)
 
     if not context.args:
-        offset = diary[uid].get("timezone_offset", 0)
+        user = db_get_user(user_id)
+        offset = user["timezone_offset"] if user else 0
         sign = "+" if offset >= 0 else ""
         await update.message.reply_text(
             f"🕐 Ваш текущий часовой пояс: *UTC{sign}{offset}*\n\n"
             "Чтобы изменить, напишите, например:\n"
-            "`/timezone +4` для Тбилиси/Баку\n"
-            "`/timezone +3` для Москвы\n"
-            "`/timezone 0`  для UTC",
+            "`/timezone +4` — Тбилиси / Баку\n"
+            "`/timezone +3` — Москва\n"
+            "`/timezone 0`  — UTC",
             parse_mode="Markdown",
         )
         return
@@ -251,14 +389,12 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "❌ Неверный формат. Используйте: `/timezone +4` (значения от -12 до +14)",
+            "❌ Неверный формат. Используйте: `/timezone +4` (от -12 до +14)",
             parse_mode="Markdown",
         )
         return
 
-    diary[uid]["timezone_offset"] = offset
-    save_diary_file(diary)
-
+    db_set_timezone(user_id, offset)
     sign = "+" if offset >= 0 else ""
     await update.message.reply_text(
         f"✅ Часовой пояс установлен: *UTC{sign}{offset}*\n"
@@ -268,77 +404,57 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Итог за сегодня с подробными записями."""
     user_id = update.effective_user.id
-    uid = str(user_id)
-    diary = load_diary()
+    db_ensure_user(user_id)
 
-    if uid not in diary:
-        await update.message.reply_text("📓 Дневник питания пуст. Сохраните первое блюдо!")
-        return
+    user = db_get_user(user_id)
+    user_tz = timezone(timedelta(hours=user["timezone_offset"]))
+    today = datetime.now(user_tz).date()
 
-    user_tz = get_user_tz(diary[uid])
-    date_str = datetime.now(user_tz).strftime("%Y-%m-%d")
-
-    if date_str not in diary[uid] or not diary[uid][date_str].get("entries"):
+    entries = db_get_day_entries(user_id, today)
+    if not entries:
         await update.message.reply_text("📓 Сегодня ещё ничего не сохранено.")
         return
 
-    day = diary[uid][date_str]
-    lines = [f"📓 *Дневник питания за {date_str}*\n"]
+    total = db_get_day_total(user_id, today)
+    lines = [f"📓 *Дневник питания за {today}*\n"]
 
-    for entry in day["entries"]:
+    for e in entries:
         lines.append(
-            f"🍽️ *{entry['dish']}* ({entry['time']})\n"
-            f"  Кал: {entry['calories']} | Б: {entry['proteins']}г | "
-            f"Ж: {entry['fats']}г | У: {entry['carbs']}г | Кл: {entry['fiber']}г\n"
+            f"🍽️ *{e['dish']}* ({e['time']})\n"
+            f"  Кал: {e['calories']} | Б: {e['proteins']}г | "
+            f"Ж: {e['fats']}г | У: {e['carbs']}г | Кл: {e['fiber']}г\n"
         )
 
     lines.append("─────────────────────")
-    lines.append(format_daily_summary(date_str, day["total"]))
+    lines.append(fmt_total(total, f"📊 *Итог за {today}*"))
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Итог по дням за последние 7 дней."""
     user_id = update.effective_user.id
-    uid = str(user_id)
-    diary = load_diary()
+    db_ensure_user(user_id)
 
-    if uid not in diary:
-        await update.message.reply_text("📓 История питания пуста.")
-        return
+    user = db_get_user(user_id)
+    user_tz = timezone(timedelta(hours=user["timezone_offset"]))
+    today = datetime.now(user_tz).date()
+    week_ago = today - timedelta(days=6)
 
-    user_tz = get_user_tz(diary[uid])
-    today = datetime.now(user_tz)
-
-    lines = ["📅 *История питания за 7 дней*\n"]
-    found_any = False
-
-    for i in range(7):
-        day_dt = today - timedelta(days=i)
-        date_str = day_dt.strftime("%Y-%m-%d")
-
-        if date_str not in diary[uid] or not diary[uid][date_str].get("entries"):
-            continue
-
-        found_any = True
-        day = diary[uid][date_str]
-        total = day["total"]
-        n = len(day["entries"])
-        label = "сегодня" if i == 0 else day_dt.strftime("%d.%m")
-
-        lines.append(
-            f"📆 *{label}* ({date_str}) — {n} зап.\n"
-            f"  Кал: *{total['calories']}* ккал | "
-            f"Б: {total['proteins']}г | Ж: {total['fats']}г | "
-            f"У: {total['carbs']}г | Кл: {total['fiber']}г\n"
-        )
-
-    if not found_any:
+    rows = db_get_history(user_id, week_ago, today)
+    if not rows:
         await update.message.reply_text("📓 За последние 7 дней записей нет.")
         return
+
+    lines = ["📅 *История питания за 7 дней*\n"]
+    for r in rows:
+        label = "сегодня" if r["date"] == today else r["date"].strftime("%d.%m")
+        lines.append(
+            f"📆 *{label}* ({r['date']}) — {r['count']} зап.\n"
+            f"  Кал: *{r['calories']}* ккал | "
+            f"Б: {r['proteins']}г | Ж: {r['fats']}г | "
+            f"У: {r['carbs']}г | Кл: {r['fiber']}г\n"
+        )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -347,12 +463,11 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    user_text = update.message.text
 
     if user_id not in user_histories:
         user_histories[user_id] = []
 
-    user_histories[user_id].append({"role": "user", "content": user_text})
+    user_histories[user_id].append({"role": "user", "content": update.message.text})
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
@@ -373,9 +488,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary")]]
             )
-            await update.message.reply_text(
-                reply, parse_mode="Markdown", reply_markup=keyboard
-            )
+            await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
         else:
             await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -397,7 +510,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
-    uid = str(user_id)
 
     await query.answer()
 
@@ -411,19 +523,15 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     nutrition = pending_nutrition.pop(user_id)
 
-    # Используем часовой пояс пользователя для записи времени
-    diary = load_diary()
-    ensure_user(diary, uid)
-    user_tz = get_user_tz(diary[uid])
+    db_ensure_user(user_id)
+    user = db_get_user(user_id)
+    user_tz = timezone(timedelta(hours=user["timezone_offset"]))
     now = datetime.now(user_tz)
-    date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M")
     dish = nutrition.pop("dish")
 
-    add_diary_entry(user_id, date_str, time_str, dish, nutrition)
+    db_add_entry(user_id, now.date(), now.strftime("%H:%M"), dish, nutrition)
 
     await query.edit_message_reply_markup(reply_markup=None)
-
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text=(
@@ -440,93 +548,67 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# ─── Ежедневный итог (каждую минуту проверяем все часовые пояса) ─────────────
+# ─── Ежедневная рассылка (каждую минуту, мульти-тайм-зона) ──────────────────
 
 async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Запускается каждую минуту.
-    Для каждого пользователя проверяет: если у него сейчас 23:55 — отправляет итог.
-    Флаг last_summary_sent предотвращает повторную отправку.
-    """
     now_utc = datetime.now(timezone.utc)
-    diary = load_diary()
-    changed = False
 
-    for uid_str, user_data in diary.items():
-        if not isinstance(user_data, dict):
-            continue
-
-        user_tz = get_user_tz(user_data)
+    for user in db_get_all_users():
+        user_tz   = timezone(timedelta(hours=user["timezone_offset"]))
         now_local = now_utc.astimezone(user_tz)
 
-        # Проверяем что сейчас 23:55 по местному времени
         if not (now_local.hour == 23 and now_local.minute == 55):
             continue
 
-        date_str = now_local.strftime("%Y-%m-%d")
+        today = now_local.date()
 
-        # Уже отправляли сегодня?
-        if user_data.get("last_summary_sent") == date_str:
+        if user["last_summary_sent"] and user["last_summary_sent"] >= today:
             continue
 
-        # Есть ли записи за сегодня?
-        if date_str not in user_data or not user_data[date_str].get("entries"):
-            # Ничего не сохранено — не отправляем, но ставим флаг чтобы не проверять снова
-            diary[uid_str]["last_summary_sent"] = date_str
-            changed = True
-            continue
+        total = db_get_day_total(user["user_id"], today)
+        db_mark_summary_sent(user["user_id"], today)
 
-        total = user_data[date_str]["total"]
-        n = len(user_data[date_str]["entries"])
+        if total is None:
+            continue  # ничего не сохранено — не отправляем
 
         text = (
-            f"🌙 *Итог питания за {date_str}*\n"
-            f"_({n} записей)_\n\n"
-            + format_daily_summary(date_str, total)
+            f"🌙 *Итог питания за {today}*\n"
+            f"_({total['count']} записей)_\n\n"
+            + fmt_total(total)
         )
 
         try:
             await context.bot.send_message(
-                chat_id=int(uid_str),
-                text=text,
-                parse_mode="Markdown",
+                chat_id=user["user_id"], text=text, parse_mode="Markdown"
             )
-            logger.info("Ежедневный итог отправлен пользователю %s за %s.", uid_str, date_str)
+            logger.info("Итог отправлен пользователю %s за %s.", user["user_id"], today)
         except Exception as e:
-            logger.warning("Не удалось отправить итог пользователю %s: %s", uid_str, e)
-
-        diary[uid_str]["last_summary_sent"] = date_str
-        changed = True
-
-    if changed:
-        save_diary_file(diary)
+            logger.warning("Не удалось отправить итог %s: %s", user["user_id"], e)
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not telegram_token:
-        raise SystemExit("Ошибка: переменная окружения TELEGRAM_BOT_TOKEN не установлена.")
+    for var in ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "DATABASE_URL"):
+        if not os.environ.get(var):
+            raise SystemExit(f"Ошибка: переменная окружения {var} не установлена.")
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not anthropic_key:
-        raise SystemExit("Ошибка: переменная окружения ANTHROPIC_API_KEY не установлена.")
+    init_db()
 
-    app = ApplicationBuilder().token(telegram_token).build()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("reset",    reset))
     app.add_handler(CommandHandler("timezone", timezone_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("stats",    stats_command))
+    app.add_handler(CommandHandler("history",  history_command))
     app.add_handler(CallbackQueryHandler(handle_save_callback, pattern="^save_diary$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Каждую минуту проверяем: у кого сейчас 23:55 по местному времени
+    # Каждую минуту проверяем у кого 23:55 по местному времени
     app.job_queue.run_repeating(check_and_send_summaries, interval=60, first=10)
 
-    logger.info("Бот запущен. Ожидаю сообщений...")
+    logger.info("Бот запущен.")
     app.run_polling()
 
 
