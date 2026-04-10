@@ -301,12 +301,12 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 def parse_nutrition_from_response(text: str) -> dict | None:
     dish_re  = re.compile(r"🍽️\s*\*{0,2}([^\*\n]+?)\*{0,2}\s*\n")
-    cal_re   = re.compile(r"Калории[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
-    prot_re  = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г",      re.IGNORECASE)
-    fat_re   = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г",       re.IGNORECASE)
-    carb_re  = re.compile(r"Углеводы[:\s]+(\d+(?:[.,]\d+)?)\s*г",   re.IGNORECASE)
-    fiber_re = re.compile(r"Клетчатка[:\s]+(\d+(?:[.,]\d+)?)\s*г",  re.IGNORECASE)
-    itogo_re = re.compile(r"(?:итого|итог)[^\n]*\n", re.IGNORECASE)
+    cal_re   = re.compile(r"Калори[а-яё]*[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
+    prot_re  = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г",           re.IGNORECASE)
+    fat_re   = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г",            re.IGNORECASE)
+    carb_re  = re.compile(r"Углеводы[:\s]+(\d+(?:[.,]\d+)?)\s*г",        re.IGNORECASE)
+    fiber_re = re.compile(r"Клетчатка[:\s]+(\d+(?:[.,]\d+)?)\s*г",       re.IGNORECASE)
+    itogo_re = re.compile(r"(?:итого|итог)\b[^\n]*\n", re.IGNORECASE)
 
     def to_float(v):
         return float(v.replace(",", "."))
@@ -566,15 +566,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_histories[user_id].append({"role": "assistant", "content": reply})
 
         nutrition = parse_nutrition_from_response(reply)
+        logger.info("Parsed nutrition for user %s: %s", user_id, nutrition)
 
         if nutrition:
             pending_nutrition[user_id] = nutrition
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary")]]
             )
-            await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+            try:
+                await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+            except Exception:
+                await update.message.reply_text(reply, reply_markup=keyboard)
         else:
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            try:
+                await update.message.reply_text(reply, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(reply)
 
     except anthropic.AuthenticationError:
         await update.message.reply_text("❌ Ошибка: неверный API ключ Anthropic.")
