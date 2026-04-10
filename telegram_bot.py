@@ -300,7 +300,7 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 # ─── Парсинг ответа Клода ────────────────────────────────────────────────────
 
 def parse_nutrition_from_response(text: str) -> dict | None:
-    dish_re  = re.compile(r"🍽️\s*\*{0,2}([^\*\n]+?)\*{0,2}\s*\n")
+    dish_re  = re.compile(r"🍽️[^\n]*?\*{1,2}([^*\n]+)\*{1,2}")
     cal_re   = re.compile(r"Калори[а-яё]*[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
     prot_re  = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г",           re.IGNORECASE)
     fat_re   = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г",            re.IGNORECASE)
