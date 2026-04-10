@@ -111,6 +111,19 @@ def db_set_timezone(user_id: int, offset: int) -> None:
         conn.commit()
 
 
+def db_delete_today_entries(user_id: int, entry_date: date) -> int:
+    """Удаляет все записи пользователя за указанную дату. Возвращает кол-во удалённых строк."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM diary_entries WHERE user_id = %s AND entry_date = %s",
+                (user_id, entry_date),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
 def db_add_entry(
     user_id: int,
     entry_date: date,
@@ -375,6 +388,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📋 *Команды:*\n"
         "/stats — итог питания за сегодня\n"
         "/history — записи за последние 7 дней\n"
+        "/cleartoday — удалить все записи за сегодня\n"
         "/timezone — установить часовой пояс\n"
         "/reset — очистить историю диалога",
         parse_mode="Markdown",
@@ -384,6 +398,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_histories[update.effective_user.id] = []
     await update.message.reply_text("История диалога очищена. Начинаем заново! 🔄")
+
+
+async def cleartoday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    db_ensure_user(user_id)
+
+    user = db_get_user(user_id)
+    user_tz = timezone(timedelta(hours=user["timezone_offset"] if user else 0))
+    today = datetime.now(user_tz).date()
+
+    total = db_get_day_total(user_id, today)
+    if total is None or total["count"] == 0:
+        await update.message.reply_text("За сегодня записей в дневнике нет.")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, удалить", callback_data=f"cleartoday_confirm:{today}"),
+        InlineKeyboardButton("❌ Отмена",      callback_data="cleartoday_cancel"),
+    ]])
+    await update.message.reply_text(
+        f"Вы уверены? Будут удалены *{total['count']} записей* за сегодня "
+        f"({total['calories']} ккал).",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_cleartoday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    if query.data == "cleartoday_cancel":
+        await query.edit_message_text("Удаление отменено.")
+        return
+
+    # callback_data: "cleartoday_confirm:YYYY-MM-DD"
+    _, date_str = query.data.split(":", 1)
+    entry_date = date.fromisoformat(date_str)
+
+    deleted = db_delete_today_entries(user_id, entry_date)
+    await query.edit_message_text(
+        f"Удалено записей: {deleted}. Дневник за {date_str} очищен."
+    )
 
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -619,12 +677,14 @@ def main() -> None:
 
     app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
-    app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("reset",    reset))
-    app.add_handler(CommandHandler("timezone", timezone_command))
-    app.add_handler(CommandHandler("stats",    stats_command))
-    app.add_handler(CommandHandler("history",  history_command))
-    app.add_handler(CallbackQueryHandler(handle_save_callback, pattern="^save_diary$"))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("reset",      reset))
+    app.add_handler(CommandHandler("timezone",   timezone_command))
+    app.add_handler(CommandHandler("stats",      stats_command))
+    app.add_handler(CommandHandler("history",    history_command))
+    app.add_handler(CommandHandler("cleartoday", cleartoday_command))
+    app.add_handler(CallbackQueryHandler(handle_save_callback,      pattern="^save_diary$"))
+    app.add_handler(CallbackQueryHandler(handle_cleartoday_callback, pattern="^cleartoday_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Каждую минуту проверяем у кого 23:55 по местному времени
