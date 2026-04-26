@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import traceback
 import anthropic
 import psycopg2
 import psycopg2.pool
@@ -837,6 +838,31 @@ async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Не удалось отправить еженедельный отчёт %s: %s", uid, e)
 
 
+# ─── Обработчик необработанных ошибок ────────────────────────────────────────
+
+ADMIN_ID = 587184112
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tb = "".join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__
+    ))
+    logger.error("Необработанная ошибка:\n%s", tb)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text = (
+        f"🚨 *Ошибка в боте:*\n\n"
+        f"`{tb[-3000:]}`\n\n"
+        f"🕐 Время: {now}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID, text=text, parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error("Не удалось отправить уведомление об ошибке: %s", e)
+
+
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def post_init(app) -> None:
@@ -870,6 +896,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_save_callback,      pattern="^save_diary$"))
     app.add_handler(CallbackQueryHandler(handle_cleartoday_callback, pattern="^cleartoday_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     # Каждую минуту проверяем у кого 23:55 по местному времени
     app.job_queue.run_repeating(check_and_send_summaries, interval=60, first=10)
