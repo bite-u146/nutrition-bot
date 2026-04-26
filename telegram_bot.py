@@ -518,6 +518,47 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    db_ensure_user(user_id)
+
+    user = db_get_user(user_id)
+    user_tz = timezone(timedelta(hours=user["timezone_offset"]))
+    today = datetime.now(user_tz).date()
+
+    # Понедельник текущей недели
+    monday = today - timedelta(days=today.weekday())
+
+    rows = db_get_history(user_id, monday, today)
+    by_date = {r["date"]: r for r in rows}
+
+    day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    lines = ["📅 *Отчёт за неделю:*\n"]
+    total_calories = 0
+    days_with_entries = 0
+
+    current = monday
+    while current <= today:
+        day_name = day_names[current.weekday()]
+        day_str = current.strftime("%d.%m")
+        if current in by_date:
+            cal = round(by_date[current]["calories"])
+            lines.append(f"{day_name} {day_str} — {cal} ккал")
+            total_calories += cal
+            days_with_entries += 1
+        else:
+            lines.append(f"{day_name} {day_str} — 0 ккал (нет записей)")
+        current += timedelta(days=1)
+
+    if days_with_entries > 0:
+        avg = round(total_calories / days_with_entries)
+        lines.append(f"\n🔥 Среднее за неделю: {avg} ккал")
+    else:
+        lines.append("\n_(за эту неделю записей нет)_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     db_ensure_user(user_id)
@@ -681,6 +722,18 @@ async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
+async def post_init(app) -> None:
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("stats",      "📊 Статистика за сегодня"),
+        BotCommand("week",       "📅 Отчёт за текущую неделю"),
+        BotCommand("history",    "📆 История за 7 дней"),
+        BotCommand("cleartoday", "🗑 Удалить записи за сегодня"),
+        BotCommand("timezone",   "🕐 Настроить часовой пояс"),
+        BotCommand("reset",      "🔄 Очистить историю диалога"),
+    ])
+
+
 def main() -> None:
     for var in ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "DATABASE_URL"):
         if not os.environ.get(var):
@@ -688,13 +741,14 @@ def main() -> None:
 
     init_db()
 
-    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("timezone",   timezone_command))
     app.add_handler(CommandHandler("stats",      stats_command))
     app.add_handler(CommandHandler("history",    history_command))
+    app.add_handler(CommandHandler("week",       week_command))
     app.add_handler(CommandHandler("cleartoday", cleartoday_command))
     app.add_handler(CallbackQueryHandler(handle_save_callback,      pattern="^save_diary$"))
     app.add_handler(CallbackQueryHandler(handle_cleartoday_callback, pattern="^cleartoday_"))
