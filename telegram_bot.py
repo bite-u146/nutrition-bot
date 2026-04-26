@@ -1,12 +1,14 @@
 import os
+import io
 import logging
 import re
 import traceback
+import zipfile
 import anthropic
 import psycopg2
 import psycopg2.pool
 from contextlib import contextmanager
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date, time as dtime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -897,6 +899,51 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error("Не удалось отправить уведомление об ошибке: %s", e)
 
 
+# ─── Резервное копирование ───────────────────────────────────────────────────
+
+def generate_backup() -> bytes:
+    """Экспортирует все таблицы в CSV через COPY TO STDOUT и упаковывает в zip."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("backup_info.txt", f"Backup generated at {now_str}\n")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for table in ("users", "diary_entries"):
+                    table_buf = io.BytesIO()
+                    cur.copy_expert(
+                        f"COPY {table} TO STDOUT WITH CSV HEADER", table_buf
+                    )
+                    zf.writestr(f"{table}.csv", table_buf.getvalue().decode("utf-8"))
+    buf.seek(0)
+    return buf.read()
+
+
+async def weekly_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(timezone.utc)
+    logger.info("Запуск еженедельного бэкапа БД...")
+    try:
+        data = generate_backup()
+        filename = f"backup_{now.strftime('%Y-%m-%d')}.zip"
+        await context.bot.send_document(
+            chat_id=ADMIN_ID,
+            document=io.BytesIO(data),
+            filename=filename,
+            caption=f"💾 Еженедельный бэкап базы данных {now.strftime('%d.%m.%Y')}",
+        )
+        logger.info("Бэкап успешно отправлен (%d байт).", len(data))
+    except Exception as e:
+        logger.error("Ошибка при создании бэкапа: %s", e)
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🚨 Ошибка при создании бэкапа:\n`{e}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def post_init(app) -> None:
@@ -934,6 +981,9 @@ def main() -> None:
 
     # Каждую минуту проверяем у кого 23:55 по местному времени
     app.job_queue.run_repeating(check_and_send_summaries, interval=60, first=10)
+
+    # Бэкап БД каждое воскресенье в 03:00 UTC (days: 0=вс, 1=пн, ..., 6=сб по PTB)
+    app.job_queue.run_daily(weekly_backup, time=dtime(3, 0, tzinfo=timezone.utc), days=(0,))
 
     logger.info("Бот запущен.")
     app.run_polling()
