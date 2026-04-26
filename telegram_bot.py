@@ -28,10 +28,13 @@ db_pool: psycopg2.pool.SimpleConnectionPool | None = None
 
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    user_id          BIGINT PRIMARY KEY,
-    timezone_offset  INTEGER NOT NULL DEFAULT 0,
-    last_summary_sent DATE
+    user_id           BIGINT PRIMARY KEY,
+    timezone_offset   INTEGER NOT NULL DEFAULT 0,
+    last_summary_sent DATE,
+    last_weekly_sent  DATE
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_sent DATE;
 
 CREATE TABLE IF NOT EXISTS diary_entries (
     id          SERIAL PRIMARY KEY,
@@ -239,10 +242,17 @@ def db_get_history(user_id: int, start_date: date, end_date: date) -> list[dict]
 def db_get_all_users() -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id, timezone_offset, last_summary_sent FROM users")
+            cur.execute(
+                "SELECT user_id, timezone_offset, last_summary_sent, last_weekly_sent FROM users"
+            )
             rows = cur.fetchall()
     return [
-        {"user_id": r[0], "timezone_offset": r[1], "last_summary_sent": r[2]}
+        {
+            "user_id": r[0],
+            "timezone_offset": r[1],
+            "last_summary_sent": r[2],
+            "last_weekly_sent": r[3],
+        }
         for r in rows
     ]
 
@@ -253,6 +263,16 @@ def db_mark_summary_sent(user_id: int, sent_date: date) -> None:
             cur.execute(
                 "UPDATE users SET last_summary_sent = %s WHERE user_id = %s",
                 (sent_date, user_id),
+            )
+        conn.commit()
+
+
+def db_mark_weekly_sent(user_id: int, week_monday: date) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET last_weekly_sent = %s WHERE user_id = %s",
+                (week_monday, user_id),
             )
         conn.commit()
 
@@ -395,7 +415,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Что умею:*\n"
         "💾 После каждого расчёта можешь сохранить еду в дневник — просто нажми кнопку\n"
         "📊 /stats — сколько уже съел сегодня\n"
-        "📅 /history — твои записи за последние 7 дней\n\n"
+        "📅 /week — отчёт за текущую неделю\n\n"
         "Каждый день в 23:55 пришлю итог за день 🌙",
         parse_mode="Markdown",
     )
@@ -559,33 +579,6 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    db_ensure_user(user_id)
-
-    user = db_get_user(user_id)
-    user_tz = timezone(timedelta(hours=user["timezone_offset"]))
-    today = datetime.now(user_tz).date()
-    week_ago = today - timedelta(days=6)
-
-    rows = db_get_history(user_id, week_ago, today)
-    if not rows:
-        await update.message.reply_text("📓 За последние 7 дней записей нет.")
-        return
-
-    lines = ["📅 *История питания за 7 дней*\n"]
-    for r in rows:
-        label = "сегодня" if r["date"] == today else r["date"].strftime("%d.%m")
-        lines.append(
-            f"📆 *{label}* ({r['date']}) — {r['count']} зап.\n"
-            f"  Кал: *{r['calories']}* ккал | "
-            f"Б: {r['proteins']}г | Ж: {r['fats']}г | "
-            f"У: {r['carbs']}г | Кл: {r['fiber']}г\n"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
 # ─── Основной обработчик сообщений ──────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -682,7 +675,7 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# ─── Ежедневная рассылка (каждую минуту, мульти-тайм-зона) ──────────────────
+# ─── Рассылка (каждую минуту, мульти-тайм-зона) ─────────────────────────────
 
 async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
     now_utc = datetime.now(timezone.utc)
@@ -695,29 +688,70 @@ async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         today = now_local.date()
+        uid   = user["user_id"]
 
-        if user["last_summary_sent"] and user["last_summary_sent"] >= today:
+        # ── Ежедневный итог ──────────────────────────────────────────────────
+        if not (user["last_summary_sent"] and user["last_summary_sent"] >= today):
+            total = db_get_day_total(uid, today)
+            db_mark_summary_sent(uid, today)
+            if total is not None:
+                text = (
+                    f"🌙 *Итог питания за {today}*\n"
+                    f"_({total['count']} записей)_\n\n"
+                    + fmt_total(total)
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid, text=text, parse_mode="Markdown"
+                    )
+                    logger.info("Дневной итог отправлен пользователю %s за %s.", uid, today)
+                except Exception as e:
+                    logger.warning("Не удалось отправить дневной итог %s: %s", uid, e)
+
+        # ── Еженедельный отчёт (только воскресенье) ──────────────────────────
+        if now_local.weekday() != 6:  # 6 = воскресенье
             continue
 
-        total = db_get_day_total(user["user_id"], today)
-        db_mark_summary_sent(user["user_id"], today)
+        monday = today - timedelta(days=6)
 
-        if total is None:
-            continue  # ничего не сохранено — не отправляем
+        if user["last_weekly_sent"] and user["last_weekly_sent"] >= monday:
+            continue
 
-        text = (
-            f"🌙 *Итог питания за {today}*\n"
-            f"_({total['count']} записей)_\n\n"
-            + fmt_total(total)
-        )
+        db_mark_weekly_sent(uid, monday)
+
+        rows = db_get_history(uid, monday, today)
+        if not rows:
+            continue  # за всю неделю нет записей — не отправляем
+
+        by_date = {r["date"]: r for r in rows}
+        day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        lines = ["📅 *Отчёт за неделю:*\n"]
+        total_calories = 0
+        days_with_entries = 0
+
+        current = monday
+        while current <= today:
+            day_name = day_names[current.weekday()]
+            day_str  = current.strftime("%d.%m")
+            if current in by_date:
+                cal = round(by_date[current]["calories"])
+                lines.append(f"{day_name} {day_str} — {cal} ккал")
+                total_calories += cal
+                days_with_entries += 1
+            else:
+                lines.append(f"{day_name} {day_str} — 0 ккал (нет записей)")
+            current += timedelta(days=1)
+
+        avg = round(total_calories / days_with_entries)
+        lines.append(f"\n🔥 Среднее за неделю: {avg} ккал")
 
         try:
             await context.bot.send_message(
-                chat_id=user["user_id"], text=text, parse_mode="Markdown"
+                chat_id=uid, text="\n".join(lines), parse_mode="Markdown"
             )
-            logger.info("Итог отправлен пользователю %s за %s.", user["user_id"], today)
+            logger.info("Еженедельный отчёт отправлен пользователю %s (неделя с %s).", uid, monday)
         except Exception as e:
-            logger.warning("Не удалось отправить итог %s: %s", user["user_id"], e)
+            logger.warning("Не удалось отправить еженедельный отчёт %s: %s", uid, e)
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -727,7 +761,6 @@ async def post_init(app) -> None:
     await app.bot.set_my_commands([
         BotCommand("stats",      "📊 Статистика за сегодня"),
         BotCommand("week",       "📅 Отчёт за текущую неделю"),
-        BotCommand("history",    "📆 История за 7 дней"),
         BotCommand("cleartoday", "🗑 Удалить записи за сегодня"),
         BotCommand("timezone",   "🕐 Настроить часовой пояс"),
         BotCommand("reset",      "🔄 Очистить историю диалога"),
@@ -747,7 +780,6 @@ def main() -> None:
     app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("timezone",   timezone_command))
     app.add_handler(CommandHandler("stats",      stats_command))
-    app.add_handler(CommandHandler("history",    history_command))
     app.add_handler(CommandHandler("week",       week_command))
     app.add_handler(CommandHandler("cleartoday", cleartoday_command))
     app.add_handler(CallbackQueryHandler(handle_save_callback,      pattern="^save_diary$"))
