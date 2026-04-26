@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_sent DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calorie_goal INTEGER;
 
 CREATE TABLE IF NOT EXISTS diary_entries (
     id          SERIAL PRIMARY KEY,
@@ -95,13 +96,13 @@ def db_get_user(user_id: int) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT timezone_offset, last_summary_sent FROM users WHERE user_id = %s",
+                "SELECT timezone_offset, last_summary_sent, calorie_goal FROM users WHERE user_id = %s",
                 (user_id,),
             )
             row = cur.fetchone()
     if row is None:
         return None
-    return {"timezone_offset": row[0], "last_summary_sent": row[1]}
+    return {"timezone_offset": row[0], "last_summary_sent": row[1], "calorie_goal": row[2]}
 
 
 def db_set_timezone(user_id: int, offset: int) -> None:
@@ -110,6 +111,16 @@ def db_set_timezone(user_id: int, offset: int) -> None:
             cur.execute(
                 "UPDATE users SET timezone_offset = %s WHERE user_id = %s",
                 (offset, user_id),
+            )
+        conn.commit()
+
+
+def db_set_calorie_goal(user_id: int, goal: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET calorie_goal = %s WHERE user_id = %s",
+                (goal, user_id),
             )
         conn.commit()
 
@@ -397,6 +408,18 @@ def fmt_total(total: dict, header: str = "") -> str:
     )
 
 
+def fmt_goal_progress(current: float, goal: int) -> str:
+    current_int = round(current)
+    percent = round(current / goal * 100)
+    filled = min(10, round(current / goal * 10))
+    bar = "▓" * filled + "░" * (10 - filled)
+    if current_int > goal:
+        status = f"🔴 Цель превышена на {current_int - goal} ккал"
+    else:
+        status = f"{current_int} / {goal} ккал — осталось {goal - current_int} ккал"
+    return f"🎯 Цель: {goal} ккал\n{bar} {percent}%\n{status}"
+
+
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -509,6 +532,46 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    db_ensure_user(user_id)
+
+    if not context.args:
+        user = db_get_user(user_id)
+        goal = user["calorie_goal"] if user else None
+        if goal:
+            await update.message.reply_text(
+                f"🎯 Твоя текущая цель: *{goal} ккал/день*\n\n"
+                "Чтобы изменить: `/goal 2000`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "🎯 Цель по калориям не установлена.\n\n"
+                "Установи командой, например: `/goal 2000`",
+                parse_mode="Markdown",
+            )
+        return
+
+    try:
+        goal = int(context.args[0])
+        if not 100 <= goal <= 10000:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Укажи число от 100 до 10000. Например: `/goal 2000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    db_set_calorie_goal(user_id, goal)
+    await update.message.reply_text(
+        f"✅ Цель установлена: *{goal} ккал/день*\n"
+        "Прогресс будет отображаться после каждого сохранения и в /stats",
+        parse_mode="Markdown",
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     db_ensure_user(user_id)
@@ -534,6 +597,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     lines.append("─────────────────────")
     lines.append(fmt_total(total, f"📊 *Итог за {today}*"))
+
+    goal = user["calorie_goal"]
+    if goal:
+        lines.append("\n" + fmt_goal_progress(total["calories"], goal))
+    else:
+        lines.append("\n_Установи цель командой /goal чтобы отслеживать прогресс_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -658,6 +727,16 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     db_add_entry(user_id, now.date(), now.strftime("%H:%M"), dish, nutrition)
 
+    total = db_get_day_total(user_id, now.date())
+    goal = user["calorie_goal"]
+
+    if goal and total:
+        progress = "\n\n" + fmt_goal_progress(total["calories"], goal)
+    elif total:
+        progress = "\n\n_Установи цель командой /goal чтобы отслеживать прогресс_"
+    else:
+        progress = ""
+
     await query.edit_message_reply_markup(reply_markup=None)
     await context.bot.send_message(
         chat_id=query.message.chat_id,
@@ -668,8 +747,8 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"├─ Белки: {nutrition['proteins']} г\n"
             f"├─ Жиры: {nutrition['fats']} г\n"
             f"├─ Углеводы: {nutrition['carbs']} г\n"
-            f"└─ Клетчатка: {nutrition['fiber']} г\n\n"
-            f"Итог за день: /stats"
+            f"└─ Клетчатка: {nutrition['fiber']} г"
+            f"{progress}"
         ),
         parse_mode="Markdown",
     )
@@ -760,6 +839,7 @@ async def post_init(app) -> None:
     from telegram import BotCommand
     await app.bot.set_my_commands([
         BotCommand("stats",      "📊 Статистика за сегодня"),
+        BotCommand("goal",       "🎯 Установить цель по калориям"),
         BotCommand("week",       "📅 Отчёт за текущую неделю"),
         BotCommand("cleartoday", "🗑 Удалить записи за сегодня"),
         BotCommand("timezone",   "🕐 Настроить часовой пояс"),
@@ -779,6 +859,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("timezone",   timezone_command))
+    app.add_handler(CommandHandler("goal",       goal_command))
     app.add_handler(CommandHandler("stats",      stats_command))
     app.add_handler(CommandHandler("week",       week_command))
     app.add_handler(CommandHandler("cleartoday", cleartoday_command))
