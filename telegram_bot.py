@@ -13,6 +13,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
     filters,
@@ -45,6 +46,12 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_sent DATE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calorie_goal INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS age INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS height_cm REAL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS weight_kg REAL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_type TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS activity_level TEXT;
 
 CREATE TABLE IF NOT EXISTS diary_entries (
     id          SERIAL PRIMARY KEY,
@@ -303,6 +310,52 @@ def db_mark_weekly_sent(user_id: int, week_monday: date) -> None:
         conn.commit()
 
 
+def db_save_profile(
+    user_id: int,
+    gender: str,
+    age: int,
+    height_cm: float,
+    weight_kg: float,
+    goal_type: str,
+    activity_level: str,
+) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET gender=%s, age=%s, height_cm=%s, weight_kg=%s,
+                    goal_type=%s, activity_level=%s
+                WHERE user_id=%s
+                """,
+                (gender, age, height_cm, weight_kg, goal_type, activity_level, user_id),
+            )
+        conn.commit()
+
+
+def db_get_profile(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT gender, age, height_cm, weight_kg, goal_type, activity_level
+                FROM users WHERE user_id=%s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    return {
+        "gender":         row[0],
+        "age":            row[1],
+        "height_cm":      row[2],
+        "weight_kg":      row[3],
+        "goal_type":      row[4],
+        "activity_level": row[5],
+    }
+
+
 # ─── Кэширующие обёртки ──────────────────────────────────────────────────────
 
 def get_user_cached(user_id: int) -> dict | None:
@@ -477,6 +530,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📋 *Доступные команды:*\n\n"
         "/stats — итог питания за сегодня\n"
         "/week — еженедельный отчёт\n"
+        "/profile — настроить личный профиль и узнать рекомендуемую норму калорий\n"
         "/goal — установить ежедневную цель по калориям\n"
         "/cleartoday — удалить все записи за сегодня\n"
         "/timezone — посмотреть / установить часовой пояс",
@@ -687,6 +741,180 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append("\n_(за эту неделю записей нет)_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── Профиль пользователя (/profile) ─────────────────────────────────────────
+
+PROFILE_GENDER, PROFILE_AGE, PROFILE_HEIGHT, PROFILE_WEIGHT, PROFILE_GOAL, PROFILE_ACTIVITY = range(6)
+
+GOAL_LABELS      = {"lose": "Похудение", "maintain": "Поддержание", "gain": "Набор массы"}
+ACTIVITY_LABELS  = {"low": "Низкий", "medium": "Средний", "high": "Высокий"}
+ACTIVITY_MULT    = {"low": 1.2, "medium": 1.375, "high": 1.55}
+GOAL_MULT        = {"lose": 0.85, "maintain": 1.0, "gain": 1.15}
+
+
+def calculate_calories(gender: str, age: int, height_cm: float, weight_kg: float,
+                        activity_level: str, goal_type: str) -> int:
+    if gender == "male":
+        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
+    else:
+        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age - 161
+    return round(bmr * ACTIVITY_MULT[activity_level] * GOAL_MULT[goal_type])
+
+
+async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    db_ensure_user(user_id)
+    context.user_data["profile"] = {}
+
+    existing = db_get_profile(user_id)
+    intro = ""
+    if existing:
+        gender_label   = "Мужской" if existing["gender"] == "male" else "Женский"
+        goal_label     = GOAL_LABELS.get(existing["goal_type"], "—")
+        activity_label = ACTIVITY_LABELS.get(existing["activity_level"], "—")
+        intro = (
+            f"📋 *Текущий профиль:*\n"
+            f"Пол: {gender_label} | Возраст: {existing['age']} лет\n"
+            f"Рост: {existing['height_cm']} см | Вес: {existing['weight_kg']} кг\n"
+            f"Цель: {goal_label} | Активность: {activity_label}\n\n"
+        )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👨 Мужской", callback_data="pg:male"),
+        InlineKeyboardButton("👩 Женский", callback_data="pg:female"),
+    ]])
+    await update.message.reply_text(
+        intro + "Шаг 1/6 — *Укажи свой пол:*",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return PROFILE_GENDER
+
+
+async def profile_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    gender = query.data.split(":")[1]
+    context.user_data["profile"]["gender"] = gender
+    label = "👨 Мужской" if gender == "male" else "👩 Женский"
+    await query.edit_message_text(f"Шаг 1/6 — Пол: *{label}*", parse_mode="Markdown")
+    await query.message.reply_text("Шаг 2/6 — *Сколько тебе лет?* (введи число)")
+    return PROFILE_AGE
+
+
+async def profile_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        age = int(update.message.text.strip())
+        if not 10 <= age <= 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректный возраст от 10 до 100.")
+        return PROFILE_AGE
+    context.user_data["profile"]["age"] = age
+    await update.message.reply_text("Шаг 3/6 — *Рост в сантиметрах?* (введи число)")
+    return PROFILE_HEIGHT
+
+
+async def profile_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        height = float(update.message.text.strip().replace(",", "."))
+        if not 100 <= height <= 250:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректный рост от 100 до 250 см.")
+        return PROFILE_HEIGHT
+    context.user_data["profile"]["height_cm"] = height
+    await update.message.reply_text("Шаг 4/6 — *Вес в килограммах?* (введи число)")
+    return PROFILE_WEIGHT
+
+
+async def profile_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        weight = float(update.message.text.strip().replace(",", "."))
+        if not 30 <= weight <= 300:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректный вес от 30 до 300 кг.")
+        return PROFILE_WEIGHT
+    context.user_data["profile"]["weight_kg"] = weight
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📉 Похудение",      callback_data="pgl:lose")],
+        [InlineKeyboardButton("⚖️ Поддержание",    callback_data="pgl:maintain")],
+        [InlineKeyboardButton("📈 Набор массы",    callback_data="pgl:gain")],
+    ])
+    await update.message.reply_text(
+        "Шаг 5/6 — *Какова твоя цель?*",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return PROFILE_GOAL
+
+
+async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    goal = query.data.split(":")[1]
+    context.user_data["profile"]["goal_type"] = goal
+    await query.edit_message_text(
+        f"Шаг 5/6 — Цель: *{GOAL_LABELS[goal]}*", parse_mode="Markdown"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🪑 Низкий — сидячий образ жизни",       callback_data="pa:low")],
+        [InlineKeyboardButton("🏃 Средний — тренировки 2-3 раза/нед",  callback_data="pa:medium")],
+        [InlineKeyboardButton("💪 Высокий — тренировки 5+ раз/нед",    callback_data="pa:high")],
+    ])
+    await query.message.reply_text(
+        "Шаг 6/6 — *Уровень физической активности:*",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return PROFILE_ACTIVITY
+
+
+async def profile_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    activity = query.data.split(":")[1]
+    await query.edit_message_text(
+        f"Шаг 6/6 — Активность: *{ACTIVITY_LABELS[activity]}*", parse_mode="Markdown"
+    )
+
+    p = context.user_data.pop("profile")
+    p["activity_level"] = activity
+    user_id = query.from_user.id
+
+    db_save_profile(
+        user_id, p["gender"], p["age"], p["height_cm"],
+        p["weight_kg"], p["goal_type"], p["activity_level"],
+    )
+
+    kcal = calculate_calories(
+        p["gender"], p["age"], p["height_cm"],
+        p["weight_kg"], p["activity_level"], p["goal_type"],
+    )
+
+    gender_label   = "👨 Мужской" if p["gender"] == "male" else "👩 Женский"
+    goal_label     = GOAL_LABELS[p["goal_type"]]
+    activity_label = ACTIVITY_LABELS[p["activity_level"]]
+
+    await query.message.reply_text(
+        f"👤 *Твой профиль сохранён!*\n\n"
+        f"Пол: {gender_label} | Возраст: {p['age']} лет\n"
+        f"Рост: {p['height_cm']} см | Вес: {p['weight_kg']} кг\n"
+        f"Цель: {goal_label} | Активность: {activity_label}\n\n"
+        f"📊 *На основе твоих данных:*\n"
+        f"🔥 Рекомендуемая норма калорий: *{kcal} ккал/день*\n\n"
+        f"💡 Хочешь установить это как цель? Введи `/goal {kcal}`",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+async def profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("profile", None)
+    await update.message.reply_text("Заполнение профиля отменено.")
+    return ConversationHandler.END
 
 
 # ─── Основной обработчик сообщений ──────────────────────────────────────────
@@ -950,6 +1178,7 @@ async def post_init(app) -> None:
     from telegram import BotCommand
     await app.bot.set_my_commands([
         BotCommand("stats",      "📊 Статистика за сегодня"),
+        BotCommand("profile",    "👤 Мой профиль и норма калорий"),
         BotCommand("goal",       "🎯 Установить цель по калориям"),
         BotCommand("week",       "📅 Отчёт за текущую неделю"),
         BotCommand("cleartoday", "🗑 Удалить записи за сегодня"),
@@ -966,6 +1195,21 @@ def main() -> None:
     init_db()
 
     app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).build()
+
+    profile_conv = ConversationHandler(
+        entry_points=[CommandHandler("profile", profile_start)],
+        states={
+            PROFILE_GENDER:   [CallbackQueryHandler(profile_gender,   pattern="^pg:")],
+            PROFILE_AGE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_age)],
+            PROFILE_HEIGHT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_height)],
+            PROFILE_WEIGHT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_weight)],
+            PROFILE_GOAL:     [CallbackQueryHandler(profile_goal,     pattern="^pgl:")],
+            PROFILE_ACTIVITY: [CallbackQueryHandler(profile_activity, pattern="^pa:")],
+        },
+        fallbacks=[CommandHandler("cancel", profile_cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(profile_conv)
 
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("reset",      reset))
