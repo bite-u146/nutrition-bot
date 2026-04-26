@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 db_pool: psycopg2.pool.SimpleConnectionPool | None = None
 
+# ─── In-memory cache ──────────────────────────────────────────────────────────
+# user_id -> {timezone_offset, last_summary_sent, calorie_goal}
+_user_cache: dict[int, dict] = {}
+# user_id -> {date, entries, total}
+_stats_cache: dict[int, dict] = {}
+
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     user_id           BIGINT PRIMARY KEY,
@@ -114,6 +120,8 @@ def db_set_timezone(user_id: int, offset: int) -> None:
                 (offset, user_id),
             )
         conn.commit()
+    if user_id in _user_cache:
+        _user_cache[user_id]["timezone_offset"] = offset
 
 
 def db_set_calorie_goal(user_id: int, goal: int) -> None:
@@ -124,6 +132,8 @@ def db_set_calorie_goal(user_id: int, goal: int) -> None:
                 (goal, user_id),
             )
         conn.commit()
+    if user_id in _user_cache:
+        _user_cache[user_id]["calorie_goal"] = goal
 
 
 def db_delete_today_entries(user_id: int, entry_date: date) -> int:
@@ -136,6 +146,7 @@ def db_delete_today_entries(user_id: int, entry_date: date) -> int:
             )
             deleted = cur.rowcount
         conn.commit()
+    _stats_cache.pop(user_id, None)
     return deleted
 
 
@@ -163,6 +174,7 @@ def db_add_entry(
                 ),
             )
         conn.commit()
+    _stats_cache.pop(user_id, None)
 
 
 def db_get_day_entries(user_id: int, entry_date: date) -> list[dict]:
@@ -287,6 +299,27 @@ def db_mark_weekly_sent(user_id: int, week_monday: date) -> None:
                 (week_monday, user_id),
             )
         conn.commit()
+
+
+# ─── Кэширующие обёртки ──────────────────────────────────────────────────────
+
+def get_user_cached(user_id: int) -> dict | None:
+    if user_id not in _user_cache:
+        user = db_get_user(user_id)
+        if user is not None:
+            _user_cache[user_id] = user
+    return _user_cache.get(user_id)
+
+
+def get_stats_cached(user_id: int, today: date) -> dict:
+    cached = _stats_cache.get(user_id)
+    if cached and cached["date"] == today:
+        return cached
+    entries = db_get_day_entries(user_id, today)
+    total = db_get_day_total(user_id, today)
+    result = {"date": today, "entries": entries, "total": total}
+    _stats_cache[user_id] = result
+    return result
 
 
 # ─── Bot logic ────────────────────────────────────────────────────────────────
@@ -458,7 +491,7 @@ async def cleartoday_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     db_ensure_user(user_id)
 
-    user = db_get_user(user_id)
+    user = get_user_cached(user_id)
     user_tz = timezone(timedelta(hours=user["timezone_offset"] if user else 0))
     today = datetime.now(user_tz).date()
 
@@ -503,7 +536,7 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     db_ensure_user(user_id)
 
     if not context.args:
-        user = db_get_user(user_id)
+        user = get_user_cached(user_id)
         offset = user["timezone_offset"] if user else 0
         sign = "+" if offset >= 0 else ""
         await update.message.reply_text(
@@ -542,7 +575,7 @@ async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db_ensure_user(user_id)
 
     if not context.args:
-        user = db_get_user(user_id)
+        user = get_user_cached(user_id)
         goal = user["calorie_goal"] if user else None
         if goal:
             await update.message.reply_text(
@@ -581,16 +614,17 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     db_ensure_user(user_id)
 
-    user = db_get_user(user_id)
+    user = get_user_cached(user_id)
     user_tz = timezone(timedelta(hours=user["timezone_offset"]))
     today = datetime.now(user_tz).date()
 
-    entries = db_get_day_entries(user_id, today)
+    stats = get_stats_cached(user_id, today)
+    entries = stats["entries"]
     if not entries:
         await update.message.reply_text("📓 Сегодня ещё ничего не сохранено.")
         return
 
-    total = db_get_day_total(user_id, today)
+    total = stats["total"]
     lines = [f"📓 *Дневник питания за {today}*\n"]
 
     for e in entries:
@@ -616,7 +650,7 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     db_ensure_user(user_id)
 
-    user = db_get_user(user_id)
+    user = get_user_cached(user_id)
     user_tz = timezone(timedelta(hours=user["timezone_offset"]))
     today = datetime.now(user_tz).date()
 
@@ -725,14 +759,14 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     nutrition = pending_nutrition.pop(user_id)
 
     db_ensure_user(user_id)
-    user = db_get_user(user_id)
+    user = get_user_cached(user_id)
     user_tz = timezone(timedelta(hours=user["timezone_offset"]))
     now = datetime.now(user_tz)
     dish = nutrition.pop("dish")
 
     db_add_entry(user_id, now.date(), now.strftime("%H:%M"), dish, nutrition)
 
-    total = db_get_day_total(user_id, now.date())
+    total = get_stats_cached(user_id, now.date())["total"]
     goal = user["calorie_goal"]
 
     if goal and total:
