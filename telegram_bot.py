@@ -52,6 +52,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS height_cm REAL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS weight_kg REAL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_type TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS activity_level TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_current INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS diary_entries (
     id          SERIAL PRIMARY KEY,
@@ -276,7 +277,8 @@ def db_get_all_users() -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id, timezone_offset, last_summary_sent, last_weekly_sent FROM users"
+                "SELECT user_id, timezone_offset, last_summary_sent, last_weekly_sent, "
+                "calorie_goal, goal_type, streak_current FROM users"
             )
             rows = cur.fetchall()
     return [
@@ -285,6 +287,9 @@ def db_get_all_users() -> list[dict]:
             "timezone_offset": r[1],
             "last_summary_sent": r[2],
             "last_weekly_sent": r[3],
+            "calorie_goal": r[4],
+            "goal_type": r[5],
+            "streak_current": r[6],
         }
         for r in rows
     ]
@@ -354,6 +359,35 @@ def db_get_profile(user_id: int) -> dict | None:
         "goal_type":      row[4],
         "activity_level": row[5],
     }
+
+
+def db_get_streak(user_id: int) -> int:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT streak_current FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def db_update_streak(user_id: int, streak: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET streak_current = %s WHERE user_id = %s",
+                (streak, user_id),
+            )
+        conn.commit()
+
+
+def check_goal_met(calories: float, goal: int, goal_type: str) -> bool:
+    """Проверяет, выполнена ли цель по калориям в зависимости от типа цели."""
+    if goal_type == "lose":
+        return calories <= goal
+    if goal_type == "maintain":
+        return goal * 0.9 <= calories <= goal * 1.1
+    if goal_type == "gain":
+        return calories >= goal
+    return False
 
 
 # ─── Кэширующие обёртки ──────────────────────────────────────────────────────
@@ -699,6 +733,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         lines.append("\n_Установи цель командой /goal чтобы отслеживать прогресс_")
 
+    streak = db_get_streak(user_id)
+    if streak > 0:
+        lines.append(f"\n🔥 Streak: {streak} дней подряд")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1042,12 +1080,25 @@ async def check_and_send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not (user["last_summary_sent"] and user["last_summary_sent"] >= today):
             total = db_get_day_total(uid, today)
             db_mark_summary_sent(uid, today)
+
+            # Обновляем streak
+            calorie_goal = user.get("calorie_goal")
+            goal_type    = user.get("goal_type")
+            new_streak   = 0
+            if calorie_goal and goal_type:
+                calories_today = total["calories"] if total else 0.0
+                if check_goal_met(calories_today, calorie_goal, goal_type):
+                    new_streak = user["streak_current"] + 1
+                db_update_streak(uid, new_streak)
+
             if total is not None:
                 text = (
                     f"🌙 *Итог питания за {today}*\n"
                     f"_({total['count']} записей)_\n\n"
                     + fmt_total(total)
                 )
+                if new_streak > 0:
+                    text += f"\n\n🔥 Streak: {new_streak} дней подряд"
                 try:
                     await context.bot.send_message(
                         chat_id=uid, text=text, parse_mode="Markdown"
