@@ -1102,6 +1102,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     db_ensure_user(user_id)
 
+    # Перехватываем ввод названия для избранного
+    if context.user_data.get("awaiting_fav_name"):
+        context.user_data.pop("awaiting_fav_name")
+        nutrition = context.user_data.pop("pending_fav_nutrition", None)
+        name = update.message.text.strip()
+        if nutrition and name:
+            db_add_favorite(user_id, name, nutrition.get("dish", name), nutrition)
+            await update.message.reply_text(
+                f"⭐ *«{name}»* добавлено в избранное!\n\n"
+                f"├─ Калории: {nutrition['calories']} ккал\n"
+                f"├─ Белки: {nutrition['proteins']} г\n"
+                f"├─ Жиры: {nutrition['fats']} г\n"
+                f"├─ Углеводы: {nutrition['carbs']} г\n"
+                f"└─ Клетчатка: {nutrition['fiber']} г",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка при сохранении. Попробуй снова.")
+        return
+
     db_append_message(user_id, "user", update.message.text)
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -1204,85 +1224,40 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─── Избранные блюда (/favorites) ────────────────────────────────────────────
 
-def _build_favorites_keyboard(favorites: list[dict]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                f"🍽️ {fav['name']} ({round(fav['calories'])} ккал)",
-                callback_data=f"fav:show:{fav['id']}",
-            ),
-            InlineKeyboardButton("❌", callback_data=f"fav:del_ask:{fav['id']}"),
-        ]
+def _menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 Мои избранные", callback_data="fav:list"),
+        InlineKeyboardButton("➕ Добавить",      callback_data="fav:add_start"),
+        InlineKeyboardButton("🗑️ Удалить",      callback_data="fav:delete_mode"),
+    ]])
+
+
+def _menu_text(has_favorites: bool) -> str:
+    if has_favorites:
+        return "⭐ *Избранные блюда*"
+    return "У тебя пока нет избранных блюд. Нажми ➕ Добавить чтобы сохранить первое!"
+
+
+def _delete_list_keyboard(favorites: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            f"❌ {fav['name']} ({round(fav['calories'])} ккал)",
+            callback_data=f"fav:del_ask:{fav['id']}",
+        )]
         for fav in favorites
-    ])
+    ]
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="fav:menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     db_ensure_user(user_id)
-    args = context.args
-
-    # /favorites add <name>
-    if args and args[0].lower() == "add":
-        if len(args) < 2:
-            await update.message.reply_text(
-                "Укажи название: `/favorites add Смузи`", parse_mode="Markdown"
-            )
-            return
-        name = " ".join(args[1:]).strip()
-        nutrition = last_nutrition.get(user_id)
-        if not nutrition:
-            await update.message.reply_text(
-                "❌ Нет данных для сохранения.\n"
-                "Сначала отправь боту описание блюда, а затем используй эту команду."
-            )
-            return
-        db_add_favorite(user_id, name, nutrition.get("dish", name), nutrition)
-        await update.message.reply_text(
-            f"⭐ *{name}* добавлено в избранное!\n\n"
-            f"├─ Калории: {nutrition['calories']} ккал\n"
-            f"├─ Белки: {nutrition['proteins']} г\n"
-            f"├─ Жиры: {nutrition['fats']} г\n"
-            f"├─ Углеводы: {nutrition['carbs']} г\n"
-            f"└─ Клетчатка: {nutrition['fiber']} г",
-            parse_mode="Markdown",
-        )
-        return
-
-    # /favorites delete
-    if args and args[0].lower() == "delete":
-        favorites = db_get_favorites(user_id)
-        if not favorites:
-            await update.message.reply_text("⭐ Список избранного пуст.")
-            return
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"❌ {fav['name']} ({round(fav['calories'])} ккал)",
-                callback_data=f"fav:del_ask:{fav['id']}",
-            )]
-            for fav in favorites
-        ])
-        await update.message.reply_text(
-            "⭐ *Избранные блюда* — выбери что удалить:",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-        return
-
-    # /favorites — показать список
     favorites = db_get_favorites(user_id)
-    if not favorites:
-        await update.message.reply_text(
-            "⭐ Список избранного пуст.\n\n"
-            "Рассчитай блюдо и сохрани его командой:\n"
-            "`/favorites add Название`",
-            parse_mode="Markdown",
-        )
-        return
     await update.message.reply_text(
-        "⭐ *Избранные блюда:*",
+        _menu_text(bool(favorites)),
         parse_mode="Markdown",
-        reply_markup=_build_favorites_keyboard(favorites),
+        reply_markup=_menu_keyboard(),
     )
 
 
@@ -1295,10 +1270,39 @@ async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAUL
     action = parts[1]
     fav_id = int(parts[2]) if len(parts) > 2 else None
 
-    if action == "show":
+    if action == "menu":
+        favorites = db_get_favorites(user_id)
+        await query.edit_message_text(
+            _menu_text(bool(favorites)),
+            parse_mode="Markdown",
+            reply_markup=_menu_keyboard(),
+        )
+
+    elif action == "list":
+        favorites = db_get_favorites(user_id)
+        if not favorites:
+            await query.edit_message_text(
+                _menu_text(False), reply_markup=_menu_keyboard()
+            )
+            return
+        rows = [
+            [InlineKeyboardButton(
+                f"🍽️ {fav['name']} ({round(fav['calories'])} ккал)",
+                callback_data=f"fav:show:{fav['id']}",
+            )]
+            for fav in favorites
+        ]
+        rows.append([InlineKeyboardButton("🔙 Назад", callback_data="fav:menu")])
+        await query.edit_message_text(
+            "⭐ *Мои избранные блюда:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif action == "show":
         fav = db_get_favorite(user_id, fav_id)
         if not fav:
-            await query.edit_message_text("❌ Блюдо не найдено.")
+            await query.edit_message_text("❌ Блюдо не найдено.", reply_markup=_menu_keyboard())
             return
         nutrition_copy = {
             "dish": fav["dish"],
@@ -1310,12 +1314,10 @@ async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAUL
         }
         pending_nutrition[user_id] = dict(nutrition_copy)
         last_nutrition[user_id] = dict(nutrition_copy)
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary"),
-                InlineKeyboardButton("🔙 Список", callback_data="fav:list"),
-            ]
-        ])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary"),
+            InlineKeyboardButton("🔙 Список",              callback_data="fav:list"),
+        ]])
         await query.edit_message_text(
             f"⭐ *{fav['name']}*\n\n"
             f"🍽️ {fav['dish']}\n"
@@ -1328,19 +1330,70 @@ async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAUL
             reply_markup=keyboard,
         )
 
+    elif action == "add_start":
+        nutrition = last_nutrition.get(user_id)
+        if not nutrition:
+            await query.edit_message_text(
+                "❌ Нет блюда для сохранения.\n\n"
+                "Сначала отправь мне описание блюда — я рассчитаю калории, "
+                "а потом сможешь добавить его в избранное.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data="fav:menu")
+                ]]),
+            )
+            return
+        context.user_data["awaiting_fav_name"] = True
+        context.user_data["pending_fav_nutrition"] = dict(nutrition)
+        await query.edit_message_text(
+            f"💾 *Сохраняю в избранное:*\n\n"
+            f"🍽️ {nutrition['dish']}\n"
+            f"├─ Калории: {nutrition['calories']} ккал\n"
+            f"├─ Белки: {nutrition['proteins']} г\n"
+            f"├─ Жиры: {nutrition['fats']} г\n"
+            f"├─ Углеводы: {nutrition['carbs']} г\n"
+            f"└─ Клетчатка: {nutrition['fiber']} г\n\n"
+            f"Введи название для этого блюда:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="fav:add_cancel")
+            ]]),
+        )
+
+    elif action == "add_cancel":
+        context.user_data.pop("awaiting_fav_name", None)
+        context.user_data.pop("pending_fav_nutrition", None)
+        favorites = db_get_favorites(user_id)
+        await query.edit_message_text(
+            _menu_text(bool(favorites)),
+            parse_mode="Markdown",
+            reply_markup=_menu_keyboard(),
+        )
+
+    elif action == "delete_mode":
+        favorites = db_get_favorites(user_id)
+        if not favorites:
+            await query.edit_message_text(
+                _menu_text(False), reply_markup=_menu_keyboard()
+            )
+            return
+        await query.edit_message_text(
+            "🗑️ *Выбери блюдо для удаления:*",
+            parse_mode="Markdown",
+            reply_markup=_delete_list_keyboard(favorites),
+        )
+
     elif action == "del_ask":
         fav = db_get_favorite(user_id, fav_id)
         if not fav:
-            await query.edit_message_text("❌ Блюдо не найдено.")
+            await query.edit_message_text("❌ Блюдо не найдено.", reply_markup=_menu_keyboard())
             return
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Да, удалить", callback_data=f"fav:del_confirm:{fav_id}"),
-            InlineKeyboardButton("🔙 Назад", callback_data="fav:list"),
-        ]])
         await query.edit_message_text(
             f"Удалить *«{fav['name']}»* из избранного?",
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"fav:del_confirm:{fav_id}"),
+                InlineKeyboardButton("🔙 Назад",       callback_data="fav:delete_mode"),
+            ]]),
         )
 
     elif action == "del_confirm":
@@ -1350,25 +1403,15 @@ async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAUL
         favorites = db_get_favorites(user_id)
         if not favorites:
             await query.edit_message_text(
-                f"✅ *{name}* удалено из избранного.\n\nСписок избранного пуст.",
+                f"✅ *{name}* удалено.\n\n{_menu_text(False)}",
                 parse_mode="Markdown",
+                reply_markup=_menu_keyboard(),
             )
             return
         await query.edit_message_text(
-            f"✅ *{name}* удалено.\n\n⭐ *Избранные блюда:*",
+            f"✅ *{name}* удалено.\n\n🗑️ *Выбери блюдо для удаления:*",
             parse_mode="Markdown",
-            reply_markup=_build_favorites_keyboard(favorites),
-        )
-
-    elif action == "list":
-        favorites = db_get_favorites(user_id)
-        if not favorites:
-            await query.edit_message_text("⭐ Список избранного пуст.")
-            return
-        await query.edit_message_text(
-            "⭐ *Избранные блюда:*",
-            parse_mode="Markdown",
-            reply_markup=_build_favorites_keyboard(favorites),
+            reply_markup=_delete_list_keyboard(favorites),
         )
 
 
