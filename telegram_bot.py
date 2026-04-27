@@ -78,6 +78,22 @@ CREATE TABLE IF NOT EXISTS conversation_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conv_history_user ON conversation_history(user_id, id);
+
+CREATE TABLE IF NOT EXISTS favorites (
+    id         SERIAL PRIMARY KEY,
+    user_id    BIGINT  NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name       TEXT    NOT NULL,
+    dish       TEXT    NOT NULL,
+    calories   REAL    NOT NULL DEFAULT 0,
+    proteins   REAL    NOT NULL DEFAULT 0,
+    fats       REAL    NOT NULL DEFAULT 0,
+    carbs      REAL    NOT NULL DEFAULT 0,
+    fiber      REAL    NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
 """
 
 
@@ -428,6 +444,79 @@ def db_clear_conversation(user_id: int) -> None:
         conn.commit()
 
 
+def db_add_favorite(user_id: int, name: str, dish: str, nutrition: dict) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO favorites (user_id, name, dish, calories, proteins, fats, carbs, fiber)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, name) DO UPDATE SET
+                    dish=EXCLUDED.dish, calories=EXCLUDED.calories,
+                    proteins=EXCLUDED.proteins, fats=EXCLUDED.fats,
+                    carbs=EXCLUDED.carbs, fiber=EXCLUDED.fiber,
+                    created_at=NOW()
+                """,
+                (user_id, name, dish,
+                 nutrition["calories"], nutrition["proteins"],
+                 nutrition["fats"], nutrition["carbs"], nutrition["fiber"]),
+            )
+        conn.commit()
+
+
+def db_get_favorites(user_id: int) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, dish, calories, proteins, fats, carbs, fiber
+                FROM favorites WHERE user_id = %s ORDER BY name
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "name": r[1], "dish": r[2],
+            "calories": r[3], "proteins": r[4],
+            "fats": r[5], "carbs": r[6], "fiber": r[7],
+        }
+        for r in rows
+    ]
+
+
+def db_get_favorite(user_id: int, fav_id: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, dish, calories, proteins, fats, carbs, fiber
+                FROM favorites WHERE user_id = %s AND id = %s
+                """,
+                (user_id, fav_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "name": row[1], "dish": row[2],
+        "calories": row[3], "proteins": row[4],
+        "fats": row[5], "carbs": row[6], "fiber": row[7],
+    }
+
+
+def db_delete_favorite(user_id: int, fav_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM favorites WHERE user_id = %s AND id = %s",
+                (user_id, fav_id),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted > 0
+
+
 def check_goal_met(calories: float, goal: int, goal_type: str) -> bool:
     """Проверяет, выполнена ли цель по калориям в зависимости от типа цели."""
     if goal_type == "lose":
@@ -497,6 +586,7 @@ SYSTEM_PROMPT = """Ты — диетолог-эксперт и нутрицио�
 Всегда отвечай на русском языке. Будь дружелюбным и полезным."""
 
 pending_nutrition: dict[int, dict] = {}
+last_nutrition: dict[int, dict] = {}
 
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -611,6 +701,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Каждый день в 23:55 пришлю итог за день 🌙\n\n"
         "📋 *Доступные команды:*\n\n"
         "/stats — итог питания за сегодня\n"
+        "/favorites — избранные блюда\n"
         "/week — еженедельный отчёт\n"
         "/profile — настроить личный профиль и узнать рекомендуемую норму калорий\n"
         "/goal — установить ежедневную цель по калориям\n"
@@ -1030,7 +1121,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info("Parsed nutrition for user %s: %s", user_id, nutrition)
 
         if nutrition:
-            pending_nutrition[user_id] = nutrition
+            last_nutrition[user_id] = dict(nutrition)
+            pending_nutrition[user_id] = dict(nutrition)
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary")]]
             )
@@ -1108,6 +1200,176 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ),
         parse_mode="Markdown",
     )
+
+
+# ─── Избранные блюда (/favorites) ────────────────────────────────────────────
+
+def _build_favorites_keyboard(favorites: list[dict]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🍽️ {fav['name']} ({round(fav['calories'])} ккал)",
+                callback_data=f"fav:show:{fav['id']}",
+            ),
+            InlineKeyboardButton("❌", callback_data=f"fav:del_ask:{fav['id']}"),
+        ]
+        for fav in favorites
+    ])
+
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    db_ensure_user(user_id)
+    args = context.args
+
+    # /favorites add <name>
+    if args and args[0].lower() == "add":
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Укажи название: `/favorites add Смузи`", parse_mode="Markdown"
+            )
+            return
+        name = " ".join(args[1:]).strip()
+        nutrition = last_nutrition.get(user_id)
+        if not nutrition:
+            await update.message.reply_text(
+                "❌ Нет данных для сохранения.\n"
+                "Сначала отправь боту описание блюда, а затем используй эту команду."
+            )
+            return
+        db_add_favorite(user_id, name, nutrition.get("dish", name), nutrition)
+        await update.message.reply_text(
+            f"⭐ *{name}* добавлено в избранное!\n\n"
+            f"├─ Калории: {nutrition['calories']} ккал\n"
+            f"├─ Белки: {nutrition['proteins']} г\n"
+            f"├─ Жиры: {nutrition['fats']} г\n"
+            f"├─ Углеводы: {nutrition['carbs']} г\n"
+            f"└─ Клетчатка: {nutrition['fiber']} г",
+            parse_mode="Markdown",
+        )
+        return
+
+    # /favorites delete
+    if args and args[0].lower() == "delete":
+        favorites = db_get_favorites(user_id)
+        if not favorites:
+            await update.message.reply_text("⭐ Список избранного пуст.")
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"❌ {fav['name']} ({round(fav['calories'])} ккал)",
+                callback_data=f"fav:del_ask:{fav['id']}",
+            )]
+            for fav in favorites
+        ])
+        await update.message.reply_text(
+            "⭐ *Избранные блюда* — выбери что удалить:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    # /favorites — показать список
+    favorites = db_get_favorites(user_id)
+    if not favorites:
+        await update.message.reply_text(
+            "⭐ Список избранного пуст.\n\n"
+            "Рассчитай блюдо и сохрани его командой:\n"
+            "`/favorites add Название`",
+            parse_mode="Markdown",
+        )
+        return
+    await update.message.reply_text(
+        "⭐ *Избранные блюда:*",
+        parse_mode="Markdown",
+        reply_markup=_build_favorites_keyboard(favorites),
+    )
+
+
+async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    parts = query.data.split(":")
+    action = parts[1]
+    fav_id = int(parts[2]) if len(parts) > 2 else None
+
+    if action == "show":
+        fav = db_get_favorite(user_id, fav_id)
+        if not fav:
+            await query.edit_message_text("❌ Блюдо не найдено.")
+            return
+        nutrition_copy = {
+            "dish": fav["dish"],
+            "calories": fav["calories"],
+            "proteins": fav["proteins"],
+            "fats": fav["fats"],
+            "carbs": fav["carbs"],
+            "fiber": fav["fiber"],
+        }
+        pending_nutrition[user_id] = dict(nutrition_copy)
+        last_nutrition[user_id] = dict(nutrition_copy)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary"),
+                InlineKeyboardButton("🔙 Список", callback_data="fav:list"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⭐ *{fav['name']}*\n\n"
+            f"🍽️ {fav['dish']}\n"
+            f"├─ Калории: {fav['calories']} ккал\n"
+            f"├─ Белки: {fav['proteins']} г\n"
+            f"├─ Жиры: {fav['fats']} г\n"
+            f"├─ Углеводы: {fav['carbs']} г\n"
+            f"└─ Клетчатка: {fav['fiber']} г",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    elif action == "del_ask":
+        fav = db_get_favorite(user_id, fav_id)
+        if not fav:
+            await query.edit_message_text("❌ Блюдо не найдено.")
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"fav:del_confirm:{fav_id}"),
+            InlineKeyboardButton("🔙 Назад", callback_data="fav:list"),
+        ]])
+        await query.edit_message_text(
+            f"Удалить *«{fav['name']}»* из избранного?",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    elif action == "del_confirm":
+        fav = db_get_favorite(user_id, fav_id)
+        name = fav["name"] if fav else "блюдо"
+        db_delete_favorite(user_id, fav_id)
+        favorites = db_get_favorites(user_id)
+        if not favorites:
+            await query.edit_message_text(
+                f"✅ *{name}* удалено из избранного.\n\nСписок избранного пуст.",
+                parse_mode="Markdown",
+            )
+            return
+        await query.edit_message_text(
+            f"✅ *{name}* удалено.\n\n⭐ *Избранные блюда:*",
+            parse_mode="Markdown",
+            reply_markup=_build_favorites_keyboard(favorites),
+        )
+
+    elif action == "list":
+        favorites = db_get_favorites(user_id)
+        if not favorites:
+            await query.edit_message_text("⭐ Список избранного пуст.")
+            return
+        await query.edit_message_text(
+            "⭐ *Избранные блюда:*",
+            parse_mode="Markdown",
+            reply_markup=_build_favorites_keyboard(favorites),
+        )
 
 
 # ─── Рассылка (каждую минуту, мульти-тайм-зона) ─────────────────────────────
@@ -1278,6 +1540,7 @@ async def post_init(app) -> None:
     from telegram import BotCommand
     await app.bot.set_my_commands([
         BotCommand("stats",      "📊 Статистика за сегодня"),
+        BotCommand("favorites",  "⭐ Избранные блюда"),
         BotCommand("profile",    "👤 Мой профиль и норма калорий"),
         BotCommand("goal",       "🎯 Установить цель по калориям"),
         BotCommand("week",       "📅 Отчёт за текущую неделю"),
@@ -1318,8 +1581,10 @@ def main() -> None:
     app.add_handler(CommandHandler("stats",      stats_command))
     app.add_handler(CommandHandler("week",       week_command))
     app.add_handler(CommandHandler("cleartoday", cleartoday_command))
-    app.add_handler(CallbackQueryHandler(handle_save_callback,      pattern="^save_diary$"))
+    app.add_handler(CommandHandler("favorites",  favorites_command))
+    app.add_handler(CallbackQueryHandler(handle_save_callback,       pattern="^save_diary$"))
     app.add_handler(CallbackQueryHandler(handle_cleartoday_callback, pattern="^cleartoday_"))
+    app.add_handler(CallbackQueryHandler(handle_favorites_callback,  pattern="^fav:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
