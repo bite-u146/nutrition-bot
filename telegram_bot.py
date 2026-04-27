@@ -1151,18 +1151,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if nutrition:
             last_nutrition[user_id] = dict(nutrition)
             pending_nutrition[user_id] = dict(nutrition)
-            keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary")]]
-            )
-            try:
-                await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
-            except Exception:
-                await update.message.reply_text(reply, reply_markup=keyboard)
         else:
-            try:
-                await update.message.reply_text(reply, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(reply)
+            # Парсинг не удался — сохраняем маркер, чтобы save_callback мог
+            # сообщить об ошибке вместо молчаливого отказа
+            pending_nutrition[user_id] = None
+
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("💾 Сохранить в дневник", callback_data="save_diary")]]
+        )
+        try:
+            await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            await update.message.reply_text(reply, reply_markup=keyboard)
 
     except anthropic.AuthenticationError:
         await update.message.reply_text("❌ Ошибка: неверный API ключ Anthropic.")
@@ -1194,6 +1194,15 @@ async def handle_save_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     nutrition = pending_nutrition.pop(user_id)
+
+    if nutrition is None:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❌ Не удалось извлечь данные о питании.\n"
+                 "Опиши блюдо точнее — например: «куриная грудка 200г».",
+        )
+        return
 
     db_ensure_user(user_id)
     user = get_user_cached(user_id)
