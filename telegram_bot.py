@@ -600,64 +600,79 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 # ─── Парсинг ответа Клода ────────────────────────────────────────────────────
 
 def parse_nutrition_from_response(text: str) -> dict | None:
-    dish_re  = re.compile(r"🍽️[^\n]*?\*{1,2}([^*\n]+)\*{1,2}")
-    cal_re   = re.compile(r"Калори[а-яё]*[:\s]+(\d+(?:[.,]\d+)?)\s*ккал", re.IGNORECASE)
-    prot_re  = re.compile(r"Белки[:\s]+(\d+(?:[.,]\d+)?)\s*г",           re.IGNORECASE)
-    fat_re   = re.compile(r"Жиры[:\s]+(\d+(?:[.,]\d+)?)\s*г",            re.IGNORECASE)
-    carb_re  = re.compile(r"Углеводы[:\s]+(\d+(?:[.,]\d+)?)\s*г",        re.IGNORECASE)
-    fiber_re = re.compile(r"Клетчатка[:\s]+(\d+(?:[.,]\d+)?)\s*г",       re.IGNORECASE)
-    itogo_re = re.compile(r"(?:итого|итог)\b[^\n]*\n", re.IGNORECASE)
+    def to_float(s: str) -> float:
+        return float(s.replace(",", "."))
 
-    def to_float(v):
-        return float(v.replace(",", "."))
+    # Гибкий разделитель: пробелы, двоеточие, тире, длинное тире
+    SEP = r"[\s:—–\-]*\s*"
 
-    def first_float(pattern, source):
-        m = pattern.search(source)
-        return to_float(m.group(1)) if m else None
+    CAL_PATS = [
+        rf"[Кк]алори[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*ккал",
+        r"(\d+(?:[.,]\d+)?)\s*[кК][кК]ал\b",
+    ]
+    PROT_PATS = [
+        rf"[Бб]елк[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+        rf"[Пп]ротеин[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+    ]
+    FAT_PATS = [
+        rf"[Жж]ир[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+    ]
+    CARB_PATS = [
+        rf"[Уу]глевод[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+    ]
+    FIBER_PATS = [
+        rf"[Кк]летчатк[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+        rf"[Пп]ищевые\s+волокна{SEP}(\d+(?:[.,]\d+)?)\s*г\b",
+    ]
 
-    def floats(p, source):
-        return [to_float(v) for v in p.findall(source)]
+    def find_all(patterns, src):
+        """Все совпадения, дедуплицированные по позиции захвата."""
+        seen, vals = set(), []
+        for p in patterns:
+            for m in re.finditer(p, src, re.IGNORECASE):
+                pos = m.start(1)
+                if pos not in seen:
+                    seen.add(pos)
+                    vals.append(to_float(m.group(1)))
+        return vals
 
-    dishes = dish_re.findall(text)
+    def find_first(patterns, src):
+        v = find_all(patterns, src)
+        return v[0] if v else None
 
-    # Ищем блок ИТОГО и берём значения оттуда
-    itogo_match = itogo_re.search(text)
-    if itogo_match:
-        itogo_text = text[itogo_match.start():]
-        cal  = first_float(cal_re,  itogo_text)
-        prot = first_float(prot_re, itogo_text)
-        fat  = first_float(fat_re,  itogo_text)
-        carb = first_float(carb_re, itogo_text)
-        fib  = first_float(fiber_re, itogo_text)
+    # Название блюда из строки с тарелкой (поддержка * и **)
+    dishes = re.findall(r"🍽️?[^\n*_]*\*{1,2}([^*\n]+?)\*{1,2}", text)
+    dishes = [d.strip() for d in dishes if d.strip()]
+
+    # Блок ИТОГО (берём итоговые значения, а не сумму каждого блюда)
+    m_itogo = re.search(r"(?:📊[^\n]*ИТОГО|ИТОГО)\b[^\n]*\n", text, re.IGNORECASE)
+    if m_itogo:
+        tail = text[m_itogo.start():]
+        cal = find_first(CAL_PATS, tail)
         if cal is not None:
             dish = ("Несколько блюд: " + ", ".join(dishes)) if dishes else "Несколько блюд"
             return {
                 "dish":     dish.strip(),
-                "calories": round(cal,  1),
-                "proteins": round(prot or 0, 1),
-                "fats":     round(fat  or 0, 1),
-                "carbs":    round(carb or 0, 1),
-                "fiber":    round(fib  or 0, 1),
+                "calories": round(cal, 1),
+                "proteins": round(find_first(PROT_PATS,  tail) or 0, 1),
+                "fats":     round(find_first(FAT_PATS,   tail) or 0, 1),
+                "carbs":    round(find_first(CARB_PATS,  tail) or 0, 1),
+                "fiber":    round(find_first(FIBER_PATS, tail) or 0, 1),
             }
 
-    # Нет блока ИТОГО — одно блюдо или сумма всех значений
-    calories_all = floats(cal_re,  text)
-    proteins_all = floats(prot_re, text)
-    fats_all     = floats(fat_re,  text)
-    carbs_all    = floats(carb_re, text)
-    fiber_all    = floats(fiber_re, text)
-
-    if not calories_all:
+    # Без блока ИТОГО — суммируем все найденные значения
+    cals = find_all(CAL_PATS, text)
+    if not cals:
         return None
 
-    dish = ", ".join(dishes) if dishes else "Блюдо"
+    dish = dishes[0] if len(dishes) == 1 else (", ".join(dishes) if dishes else "Блюдо")
     return {
         "dish":     dish.strip(),
-        "calories": round(sum(calories_all), 1),
-        "proteins": round(sum(proteins_all), 1),
-        "fats":     round(sum(fats_all),     1),
-        "carbs":    round(sum(carbs_all),    1),
-        "fiber":    round(sum(fiber_all),    1),
+        "calories": round(sum(cals), 1),
+        "proteins": round(sum(find_all(PROT_PATS,  text)), 1),
+        "fats":     round(sum(find_all(FAT_PATS,   text)), 1),
+        "carbs":    round(sum(find_all(CARB_PATS,  text)), 1),
+        "fiber":    round(sum(find_all(FIBER_PATS, text)), 1),
     }
 
 
