@@ -603,8 +603,8 @@ def parse_nutrition_from_response(text: str) -> dict | None:
     def to_float(s: str) -> float:
         return float(s.replace(",", "."))
 
-    # Гибкий разделитель: пробелы, двоеточие, тире, длинное тире
-    SEP = r"[\s:—–\-]*\s*"
+    # Гибкий разделитель: пробелы, двоеточие, тире, длинное тире, markdown-символы (* _)
+    SEP = r"[\s:—–\-\*\_]*\s*"
 
     CAL_PATS = [
         rf"[Кк]алори[а-яёА-ЯЁ]*{SEP}(\d+(?:[.,]\d+)?)\s*ккал",
@@ -645,7 +645,7 @@ def parse_nutrition_from_response(text: str) -> dict | None:
     dishes = [d.strip() for d in dishes if d.strip()]
 
     # Блок ИТОГО (берём итоговые значения, а не сумму каждого блюда)
-    m_itogo = re.search(r"(?:📊[^\n]*ИТОГО|ИТОГО)\b[^\n]*\n", text, re.IGNORECASE)
+    m_itogo = re.search(r"(?:📊[^\n]*ИТОГО|ИТОГО)\b", text, re.IGNORECASE)
     if m_itogo:
         tail = text[m_itogo.start():]
         cal = find_first(CAL_PATS, tail)

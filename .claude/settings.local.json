@@ -3,7 +3,8 @@
     "allow": [
       "Skill(claude-api)",
       "Bash(python:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(iconv -f cp1251 -t utf-8)"
     ]
   }
 }
